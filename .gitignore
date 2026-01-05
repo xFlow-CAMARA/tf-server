@@ -1,0 +1,10 @@
+.venv
+.mypy_cache
+.pytest_cache
+.pyc
+__pycache__/
+.vscode/
+.log
+.tar.gz
+/dist
+src/sunrise6g_opensdk.egg-info/

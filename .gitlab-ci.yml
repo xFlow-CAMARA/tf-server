@@ -1,0 +1,65 @@
+stages:
+  - validate
+  - build
+  - publish
+
+variables:
+  PACKAGE_NAME: sunrise6g-opensdk
+
+validate-mr:
+  stage: validate
+  image: python:3.12-slim
+  before_script:
+    - echo "Running merge request validation..."
+    - pip install -r requirements.txt
+    - pip install -e .
+    - pip install isort black flake8 pytest
+  script:
+    - echo "Running linters..."
+    - isort src tests --check --profile black --filter-files
+    - black src tests --check --line-length=100
+    - flake8 src tests
+    - echo "Running tests..."
+    - pytest -v tests/common/test_invoke_edgecloud_clients.py
+    - pytest -v tests/common/test_invoke_network_clients.py
+  only:
+    - merge_requests
+
+build-package:
+  stage: build
+  image: python:3.12-slim
+  before_script:
+    - pip install build twine
+    - pip install -r requirements.txt
+    - pip install -e .
+  script:
+    - echo "Building Python package..."
+    - python -m build
+    - echo "Package built successfully"
+    - ls -la dist/
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 day
+  only:
+    - main
+    - develop
+    - tags
+
+publish-gitlab:
+  stage: publish
+  image: python:3.12-slim
+  dependencies:
+    - build-package
+  before_script:
+    - pip install twine
+  script:
+    - echo "Validating package format..."
+    - twine check dist/*
+    - echo "Publishing to Package Registry..."
+    - TWINE_PASSWORD="$CI_JOB_TOKEN" TWINE_USERNAME="gitlab-ci-token" python -m twine upload --repository-url ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi dist/*
+    - echo "Package published successfully"
+  only:
+    - main
+    - develop
+    - tags
