@@ -35,11 +35,13 @@ import camara_qod
 import camara_location
 import camara_traffic_influence
 import camara_number_verification
+import camara_device_status
 
 app.include_router(camara_qod.router)
 app.include_router(camara_location.router)
 app.include_router(camara_traffic_influence.router)
 app.include_router(camara_number_verification.router)
+app.include_router(camara_device_status.router)
 
 # Store multiple network clients for different 5G cores
 network_clients = {}
@@ -102,6 +104,7 @@ camara_qod.network_clients = network_clients
 camara_location.network_clients = network_clients
 camara_traffic_influence.network_clients = network_clients
 camara_number_verification.network_clients = network_clients
+camara_device_status.network_clients = network_clients
 
 def get_client(core: str = "coresim"):
     """Get network client for specified core"""

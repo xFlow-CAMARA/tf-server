@@ -6,7 +6,7 @@
 #   - Auto-generated for CoreSim support
 ##
 import uuid
-from typing import Dict
+from typing import Dict, Optional
 
 import requests
 from pydantic import ValidationError
@@ -52,6 +52,7 @@ class NetworkManager(BaseNetworkClient):
         base_url: str = "http://core-simulator:8080",
         scs_as_id: str = "nef",
         oam_port: int = 8081,
+        metrics_port: int = 9090,
         redis_addr: str = "redis:6379",
         nef_callback_url: str = "http://core-network-service:9090/eventsubscriptions",
         qod_base_url: str = "http://localhost:8100",
@@ -66,6 +67,7 @@ class NetworkManager(BaseNetworkClient):
             base_url: CoreSim SBI base URL (default: docker internal http://core-simulator:8080)
             scs_as_id: NEF service identifier (default: nef)
             oam_port: CoreSim OAM API port (default: 8081)
+            metrics_port: CoreSim Prometheus metrics port (default: 9090)
             redis_addr: Redis service address for data persistence
             nef_callback_url: Callback URL for event notifications
             qod_base_url: NEF QoD service base URL (default: http://localhost:8100)
@@ -77,6 +79,7 @@ class NetworkManager(BaseNetworkClient):
             self.base_url = base_url
             self.scs_as_id = scs_as_id
             self.oam_port = oam_port
+            self.metrics_port = metrics_port
             self.redis_addr = redis_addr
             self.nef_callback_url = nef_callback_url
             
@@ -86,8 +89,9 @@ class NetworkManager(BaseNetworkClient):
             self.ti_base_url = ti_base_url
             self.ue_identity_base_url = ue_identity_base_url
             
-            # Extract host from base_url for OAM API
+            # Extract host from base_url for OAM and metrics APIs
             self.oam_base_url = base_url.rsplit(":", 1)[0] + f":{oam_port}"
+            self.metrics_url = base_url.rsplit(":", 1)[0] + f":{metrics_port}/metrics"
             
             log.info(
                 f"Initialized CoreSim NetworkManager for NEF\n"
@@ -240,6 +244,282 @@ class NetworkManager(BaseNetworkClient):
             raise NetworkPlatformError(f"Failed to resolve MSISDN for IP {ip_address}: {e}") from e
         except requests.exceptions.ConnectionError as e:
             raise NetworkPlatformError(f"Failed to connect to UE Identity Service: {e}") from e
+
+    def _get_ue_profile_from_metrics(self, ip_address: str) -> Optional[Dict]:
+        """
+        Fallback method: Get UE profile from CoreSim metrics.
+        
+        This is used when ue-identity-service and ue-profile-service don't have the UE data.
+        Parses the Prometheus metrics from CoreSim to find UE info and returns a simulated profile.
+        
+        Args:
+            ip_address: The UE's IP address
+            
+        Returns:
+            Dictionary with simulated UE profile, or None if UE not found
+        """
+        import re
+        
+        try:
+            # Query CoreSim metrics
+            metrics_url = f"{self.metrics_url}"
+            response = requests.get(metrics_url, timeout=5)
+            
+            if response.status_code != 200:
+                return None
+            
+            metrics_text = response.text
+            
+            # Parse ue_ip_info metric to find UE by IP
+            # Format: ue_ip_info{imsi="001010000000001",ip="12.1.0.1",...} 1
+            pattern = r'ue_ip_info\{imsi="([^"]+)",ip="([^"]+)"[^}]*\}\s+1'
+            
+            for match in re.finditer(pattern, metrics_text):
+                imsi = match.group(1)
+                ip = match.group(2)
+                
+                if ip == ip_address:
+                    # Found the UE - return simulated profile
+                    # For CoreSim, assume all UEs are registered and connected
+                    log.info(f"Found UE in CoreSim metrics: IMSI={imsi}, IP={ip}")
+                    
+                    # Generate MSISDN from IMSI (CoreSim convention)
+                    msisdn = f"+336{imsi[-8:]}"
+                    
+                    return {
+                        "Supi": imsi,
+                        "Msisdn": msisdn,
+                        "IpAddress": ip_address,
+                        "RegistrationStatus": "REGISTERED",
+                        "ConnectionStatus": "CONNECTED",
+                        "Plmn": {"mcc": "001", "mnc": "06"},
+                        "PduSessions": {"default": {"dnn": "internet", "state": "active"}}
+                    }
+            
+            return None
+            
+        except Exception as e:
+            log.warning(f"Failed to get UE profile from metrics: {e}")
+            return None
+
+    # CAMARA Device Status API support
+    def get_ue_profile_by_ip(self, ip_address: str) -> Dict:
+        """
+        Get UE profile (status, registration, PLMN) by IP address.
+        
+        Used by CAMARA Device Status API to check reachability and roaming status.
+        
+        Args:
+            ip_address: The UE's IP address (e.g., "12.1.0.1")
+            
+        Returns:
+            Dictionary with UE profile data including:
+            - Supi: IMSI identifier
+            - RegistrationStatus: "REGISTERED" or "DEREGISTERED"
+            - ConnectionStatus: "CONNECTED" or "IDLE"
+            - Plmn: {"mcc": "xxx", "mnc": "xx"}
+            - PduSessions: Active PDU session info
+            
+        Raises:
+            NetworkPlatformError: If UE profile cannot be found
+        """
+        # Try ue-identity-service first
+        try:
+            # First resolve IP to SUPI via ue-identity-service
+            url = f"{self.ue_identity_base_url}/ue-identity/v1/supi?ip={ip_address}"
+            response = requests.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                supi = data.get("Supi") or data.get("supi")
+                
+                if supi:
+                    return self.get_ue_profile_by_supi(supi)
+            
+            # Fallback: Try to get profile from Redis/CoreSim directly
+            # Query ue-identity-service for full profile
+            url = f"{self.ue_identity_base_url}/ue-identity/v1/profile?ip={ip_address}"
+            response = requests.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                return response.json()
+                
+        except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            log.debug(f"UE Identity Service not available, trying metrics fallback: {e}")
+        
+        # Fallback: Check CoreSim metrics for UE existence and return simulated profile
+        profile = self._get_ue_profile_from_metrics(ip_address)
+        if profile:
+            return profile
+        
+        raise NetworkPlatformError(f"No UE profile found for IP {ip_address}")
+
+    def get_ue_profile_by_supi(self, supi: str) -> Dict:
+        """
+        Get UE profile by SUPI (IMSI).
+        
+        Args:
+            supi: IMSI identifier (e.g., "001010000000001")
+            
+        Returns:
+            Dictionary with UE profile data
+            
+        Raises:
+            NetworkPlatformError: If UE profile cannot be found
+        """
+        try:
+            # Try ue-profile-service first (if available)
+            ue_profile_url = "http://ue-profile-service:8080"
+            url = f"{ue_profile_url}/ue-profile/v1/profiles/{supi}"
+            response = requests.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                return response.json()
+            
+            # Fallback: Query ue-identity-service
+            url = f"{self.ue_identity_base_url}/ue-identity/v1/profile?supi={supi}"
+            response = requests.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                return response.json()
+            
+            raise NetworkPlatformError(f"No UE profile found for SUPI {supi}")
+            
+        except requests.exceptions.HTTPError as e:
+            raise NetworkPlatformError(f"Failed to get UE profile for SUPI {supi}: {e}") from e
+        except requests.exceptions.ConnectionError as e:
+            raise NetworkPlatformError(f"Failed to connect to profile service: {e}") from e
+
+    def get_ue_profile_by_msisdn(self, msisdn: str) -> Dict:
+        """
+        Get UE profile by MSISDN (phone number).
+        
+        Args:
+            msisdn: Phone number in E.164 format (e.g., "+33612345678")
+            
+        Returns:
+            Dictionary with UE profile data
+            
+        Raises:
+            NetworkPlatformError: If UE profile cannot be found
+        """
+        try:
+            # Query ue-identity-service for SUPI by MSISDN
+            url = f"{self.ue_identity_base_url}/ue-identity/v1/supi?msisdn={msisdn}"
+            response = requests.get(url, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                supi = data.get("Supi") or data.get("supi")
+                if supi:
+                    return self.get_ue_profile_by_supi(supi)
+            
+            raise NetworkPlatformError(f"No UE profile found for MSISDN {msisdn}")
+            
+        except requests.exceptions.HTTPError as e:
+            raise NetworkPlatformError(f"Failed to get UE profile for MSISDN {msisdn}: {e}") from e
+        except requests.exceptions.ConnectionError as e:
+            raise NetworkPlatformError(f"Failed to connect to UE Identity Service: {e}") from e
+
+    def get_device_reachability_status(self, ip_address: str) -> Dict:
+        """
+        Get device reachability status for CAMARA Device Status API.
+        
+        Args:
+            ip_address: The UE's IP address
+            
+        Returns:
+            Dictionary with:
+            - reachabilityStatus: "CONNECTED_DATA", "CONNECTED_SMS", or "NOT_CONNECTED"
+            - lastStatusTime: ISO 8601 timestamp
+        """
+        from datetime import datetime, timezone
+        
+        try:
+            profile = self.get_ue_profile_by_ip(ip_address)
+            
+            conn_status = profile.get("ConnectionStatus", "").upper()
+            reg_status = profile.get("RegistrationStatus", "").upper()
+            
+            # Map to CAMARA ConnectivityStatus
+            if reg_status in ["DEREGISTERED", "NOT_REGISTERED"]:
+                status = "NOT_CONNECTED"
+            elif conn_status == "CONNECTED":
+                pdu_sessions = profile.get("PduSessions", {})
+                if pdu_sessions and len(pdu_sessions) > 0:
+                    status = "CONNECTED_DATA"
+                else:
+                    status = "CONNECTED_SMS"
+            elif conn_status == "IDLE":
+                status = "CONNECTED_SMS"
+            else:
+                status = "NOT_CONNECTED"
+            
+            return {
+                "reachabilityStatus": status,
+                "lastStatusTime": datetime.now(timezone.utc).isoformat()
+            }
+            
+        except NetworkPlatformError:
+            return {
+                "reachabilityStatus": "NOT_CONNECTED",
+                "lastStatusTime": datetime.now(timezone.utc).isoformat()
+            }
+
+    def get_device_roaming_status(self, ip_address: str, home_mcc: str = "001", home_mnc: str = "06") -> Dict:
+        """
+        Get device roaming status for CAMARA Device Status API.
+        
+        Args:
+            ip_address: The UE's IP address
+            home_mcc: Home PLMN MCC (default: "001" for test network)
+            home_mnc: Home PLMN MNC (default: "06")
+            
+        Returns:
+            Dictionary with:
+            - roaming: bool
+            - countryCode: ISO 3166-1 alpha-2 code (optional)
+            - countryName: List of country names (optional)
+        """
+        MCC_COUNTRY_MAP = {
+            "001": {"code": "XX", "name": "Test Network"},
+            "208": {"code": "FR", "name": "France"},
+            "310": {"code": "US", "name": "United States"},
+            "311": {"code": "US", "name": "United States"},
+            "234": {"code": "GB", "name": "United Kingdom"},
+            "262": {"code": "DE", "name": "Germany"},
+            "222": {"code": "IT", "name": "Italy"},
+            "214": {"code": "ES", "name": "Spain"},
+            "505": {"code": "AU", "name": "Australia"},
+            "440": {"code": "JP", "name": "Japan"},
+            "450": {"code": "KR", "name": "South Korea"},
+            "460": {"code": "CN", "name": "China"},
+        }
+        
+        try:
+            profile = self.get_ue_profile_by_ip(ip_address)
+            
+            plmn = profile.get("Plmn", {})
+            current_mcc = plmn.get("mcc", "") or plmn.get("Mcc", "")
+            current_mnc = plmn.get("mnc", "") or plmn.get("Mnc", "")
+            
+            if not current_mcc:
+                return {"roaming": False}
+            
+            # Check if roaming (different from home PLMN)
+            is_roaming = (current_mcc != home_mcc) or (current_mnc != home_mnc)
+            
+            # Get country info
+            country_info = MCC_COUNTRY_MAP.get(current_mcc, {"code": "XX", "name": "Unknown"})
+            
+            return {
+                "roaming": is_roaming,
+                "countryCode": country_info["code"],
+                "countryName": [country_info["name"]]
+            }
+            
+        except NetworkPlatformError:
+            return {"roaming": False}
 
     def verify_phone_number(self, ip_address: str, phone_number: str = None, hashed_phone_number: str = None) -> bool:
         """
