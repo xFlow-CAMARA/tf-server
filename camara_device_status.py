@@ -39,13 +39,13 @@ from camara_models.device_status import (
 )
 from camara_models.common import ErrorInfo
 
-router = APIRouter(prefix="/device-status", tags=["CAMARA Device Status"])
+router = APIRouter(prefix="/device-reachability-status/v1", tags=["CAMARA Device Status"])
 
 # Shared network clients (populated by api_server.py)
 network_clients = {}
 
 # x-correlator pattern from CAMARA spec
-X_CORRELATOR_PATTERN = r'^[a-zA-Z0-9\-_:;.\/<>{}]{0,256}$'
+X_CORRELATOR_PATTERN = r'^[a-zA-Z0-9-]{0,55}$'
 
 # Default home PLMN for demo (can be configured)
 HOME_PLMN = {
@@ -251,7 +251,7 @@ def map_status_to_camara(legacy_status: ConnectivityStatus) -> tuple[bool, Optio
 
 
 @router.post(
-    "/reachability/v1/retrieve",
+    "/retrieve",
     response_model=ReachabilityStatusResponse,
     responses={
         200: {"description": "Contains information about current reachability status"},
@@ -274,7 +274,7 @@ async def get_reachability_status(
     """
     CAMARA Device Reachability Status: Get the current reachability status
     
-    POST /device-status/reachability/v1/retrieve
+    POST /device-reachability-status/v1/retrieve
     
     Returns whether a device is reachable and the connectivity types available:
     - reachable: true/false indicating overall reachability
@@ -302,7 +302,7 @@ async def get_reachability_status(
             return camara_error_response(
                 422,
                 "MISSING_IDENTIFIER",
-                "The device cannot be identified. Provide device identifier or use 3-legged token.",
+                "The device cannot be identified.",
                 correlator
             )
         
@@ -340,7 +340,7 @@ async def get_reachability_status(
             return camara_error_response(
                 404,
                 "IDENTIFIER_NOT_FOUND",
-                "The device identifier provided is not associated with a customer account",
+                "The phone number provided is not associated with a customer account",
                 correlator
             )
         
@@ -368,7 +368,7 @@ async def get_reachability_status(
         return camara_error_response(
             500,
             "INTERNAL",
-            f"Internal server error: {str(e)}",
+            "Internal server error.",
             correlator
         )
 
@@ -414,9 +414,9 @@ async def get_roaming_status(
         
         if not resolved_ip:
             return camara_error_response(
-                400,
-                "INVALID_ARGUMENT",
-                "Device IP address is required",
+                422,
+                "MISSING_IDENTIFIER",
+                "The device cannot be identified.",
                 correlator
             )
         
@@ -435,8 +435,8 @@ async def get_roaming_status(
         if not profile:
             return camara_error_response(
                 404,
-                "DEVICE_NOT_FOUND",
-                "The specified device was not found",
+                "IDENTIFIER_NOT_FOUND",
+                "The phone number provided is not associated with a customer account",
                 correlator
             )
         
@@ -452,7 +452,7 @@ async def get_roaming_status(
         return camara_error_response(
             500,
             "INTERNAL",
-            f"Internal server error: {str(e)}",
+            "Internal server error.",
             correlator
         )
 
@@ -566,7 +566,7 @@ async def delete_reachability_subscription(
     response.headers["x-correlator"] = correlator
     
     if subscriptionId not in subscriptions["reachability"]:
-        return camara_error_response(404, "NOT_FOUND", "Subscription not found", correlator)
+        return camara_error_response(404, "NOT_FOUND", "The specified resource is not found.", correlator)
     
     del subscriptions["reachability"][subscriptionId]
     return Response(status_code=204, headers={"x-correlator": correlator})
@@ -650,7 +650,7 @@ async def get_roaming_subscription(
     
     sub = subscriptions["roaming"].get(subscriptionId)
     if not sub:
-        return camara_error_response(404, "NOT_FOUND", "Subscription not found", correlator)
+        return camara_error_response(404, "NOT_FOUND", "The specified resource is not found.", correlator)
     
     return SubscriptionResponse(
         subscriptionId=sub["subscriptionId"],
@@ -679,7 +679,7 @@ async def delete_roaming_subscription(
     response.headers["x-correlator"] = correlator
     
     if subscriptionId not in subscriptions["roaming"]:
-        return camara_error_response(404, "NOT_FOUND", "Subscription not found", correlator)
+        return camara_error_response(404, "NOT_FOUND", "The specified resource is not found.", correlator)
     
     del subscriptions["roaming"][subscriptionId]
     return Response(status_code=204, headers={"x-correlator": correlator})

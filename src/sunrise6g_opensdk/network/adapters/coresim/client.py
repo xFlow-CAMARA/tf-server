@@ -9,7 +9,6 @@ import uuid
 from typing import Dict, Optional
 
 import requests
-from pydantic import ValidationError
 
 from sunrise6g_opensdk import logger
 from sunrise6g_opensdk.network.adapters.errors import NetworkPlatformError
@@ -219,6 +218,7 @@ class NetworkManager(BaseNetworkClient):
         Get the MSISDN (phone number) for a UE by its IP address.
         
         This method queries the UE Identity Service to resolve IP → MSISDN.
+        Falls back to CoreSim metrics if the identity service doesn't have the data.
         Used by CAMARA Number Verification API.
         
         Args:
@@ -230,20 +230,27 @@ class NetworkManager(BaseNetworkClient):
         Raises:
             NetworkPlatformError: If the MSISDN cannot be found
         """
+        # Try UE Identity Service first
         try:
             url = f"{self.ue_identity_base_url}/msisdn?ip={ip_address}"
-            response = requests.get(url)
+            response = requests.get(url, timeout=5)
             response.raise_for_status()
             data = response.json()
             msisdn = data.get("Msisdn")
-            if not msisdn:
-                raise NetworkPlatformError(f"No MSISDN found for IP {ip_address}")
-            log.info(f"Resolved IP {ip_address} to MSISDN {msisdn}")
+            if msisdn:
+                log.info(f"Resolved IP {ip_address} to MSISDN {msisdn} via UE Identity Service")
+                return msisdn
+        except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            log.debug(f"UE Identity Service lookup failed for IP {ip_address}: {e}")
+        
+        # Fallback: Get MSISDN from CoreSim metrics
+        profile = self._get_ue_profile_from_metrics(ip_address)
+        if profile and profile.get("Msisdn"):
+            msisdn = profile.get("Msisdn")
+            log.info(f"Resolved IP {ip_address} to MSISDN {msisdn} via CoreSim metrics")
             return msisdn
-        except requests.exceptions.HTTPError as e:
-            raise NetworkPlatformError(f"Failed to resolve MSISDN for IP {ip_address}: {e}") from e
-        except requests.exceptions.ConnectionError as e:
-            raise NetworkPlatformError(f"Failed to connect to UE Identity Service: {e}") from e
+        
+        raise NetworkPlatformError(f"No MSISDN found for IP {ip_address}")
 
     def _get_ue_profile_from_metrics(self, ip_address: str) -> Optional[Dict]:
         """
@@ -582,7 +589,7 @@ class NetworkManager(BaseNetworkClient):
         CoreSim is flexible with QoD parameters as it supports 3GPP standards.
         """
         if session_info.qosProfile is None:
-            raise ValidationError("QoS profile is required")
+            raise ValueError("QoS profile is required")
         
         # CoreSim supports standard 5QI values
         valid_profiles = ["qos-e", "qos-s", "qos-m", "qos-l"]
@@ -633,14 +640,14 @@ class NetworkManager(BaseNetworkClient):
         """
         device = retrieve_location_request.device
         if device is None:
-            raise ValidationError("Device information is required for location monitoring")
+            raise ValueError("Device information is required for location monitoring")
         
         # At least one identifier required
         has_msisdn = hasattr(device, 'phoneNumber') and device.phoneNumber
         has_nai = hasattr(device, 'networkAccessIdentifier') and device.networkAccessIdentifier
         
         if not (has_msisdn or has_nai):
-            raise ValidationError(
+            raise ValueError(
                 "CoreSim requires either phoneNumber or networkAccessIdentifier for location monitoring"
             )
 
@@ -675,14 +682,14 @@ class NetworkManager(BaseNetworkClient):
         CoreSim requires app and device information for traffic steering.
         """
         if traffic_influence_info.appId is None:
-            raise ValidationError("Application ID is required for traffic influence")
+            raise ValueError("Application ID is required for traffic influence")
         
         if traffic_influence_info.appInstanceId is None:
-            raise ValidationError("Application instance ID (server IP) is required")
+            raise ValueError("Application instance ID (server IP) is required")
         
         device_ip = traffic_influence_info.retrieve_ue_ipv4()
         if device_ip is None:
-            raise ValidationError("Device IP address is required for traffic influence")
+            raise ValueError("Device IP address is required for traffic influence")
         
         log.info(
             f"Traffic influence validation passed: "

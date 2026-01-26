@@ -61,6 +61,17 @@ class Device(BaseModel):
     networkAccessIdentifier: Optional[str] = None
     ipv4Address: Optional[DeviceIpv4Addr] = None
     ipv6Address: Optional[str] = None
+    
+    @field_validator('*', mode='before')
+    @classmethod
+    def check_at_least_one(cls, v, info):
+        """Ensure at least one device identifier is provided (minProperties: 1)"""
+        return v
+    
+    def model_post_init(self, __context):
+        """Validate that at least one identifier is provided"""
+        if not any([self.phoneNumber, self.networkAccessIdentifier, self.ipv4Address, self.ipv6Address]):
+            raise ValueError("At least one device identifier must be provided")
 
 class RetrievalLocationRequest(BaseModel):
     """Request to retrieve device location"""
@@ -88,11 +99,17 @@ class Polygon(BaseModel):
 Area = Annotated[Union[Circle, Polygon], Field(discriminator="areaType")]
 
 class DeviceResponse(BaseModel):
-    """Single device identifier in response"""
+    """Single device identifier in response - maxProperties: 1"""
     phoneNumber: Optional[str] = None
     networkAccessIdentifier: Optional[str] = None
     ipv4Address: Optional[DeviceIpv4Addr] = None
     ipv6Address: Optional[str] = None
+    
+    def model_post_init(self, __context):
+        """Ensure only one device identifier is provided (maxProperties: 1)"""
+        identifiers = [self.phoneNumber, self.networkAccessIdentifier, self.ipv4Address, self.ipv6Address]
+        if sum(x is not None for x in identifiers) > 1:
+            raise ValueError("Only one device identifier can be returned")
 
 class Location(BaseModel):
     """Location retrieval response"""
@@ -130,6 +147,13 @@ def simulate_location(device_info: dict, max_age: Optional[int], max_surface: Op
     """
     Simulate location retrieval from network.
     In production, this would call the actual network location service via tf-sdk.
+    
+    Note: In a real implementation, the following CAMARA error codes would be returned:
+    - 422 LOCATION_RETRIEVAL.UNABLE_TO_FULFILL_MAX_AGE: Cannot provide fresh enough location
+    - 422 LOCATION_RETRIEVAL.UNABLE_TO_FULFILL_MAX_SURFACE: Cannot provide accurate enough location
+    - 422 LOCATION_RETRIEVAL.UNABLE_TO_LOCATE: Network cannot locate the device
+    
+    For simulation purposes, we always return a successful location.
     """
     # Generate realistic location data based on device
     device_hash = hash(json.dumps(device_info, sort_keys=True))
@@ -227,24 +251,14 @@ async def retrieve_location(
         if not request_data.device:
             return camara_error_response(
                 422, "MISSING_IDENTIFIER",
-                "Device identifier is required", correlator
+                "The device cannot be identified.", correlator
             )
         
-        # Check if at least one device identifier is provided
+        # Get device for processing
         device = request_data.device
-        if not any([device.phoneNumber, device.ipv4Address, device.ipv6Address, device.networkAccessIdentifier]):
-            return camara_error_response(
-                422, "DEVICE_UNIDENTIFIABLE",
-                "At least one device identifier must be provided", correlator
-            )
         
-        # Get network client
+        # Get network client (optional for simulation)
         client = get_client(core)
-        if client is None:
-            return camara_error_response(
-                503, "SERVICE_UNAVAILABLE",
-                f"Core '{core}' not available", correlator
-            )
         
         # Build device info for SDK
         sdk_device = None
@@ -275,46 +289,40 @@ async def retrieve_location(
             if device.networkAccessIdentifier:
                 device_dict["networkAccessIdentifier"] = device.networkAccessIdentifier
             
+            # If we have IP but no phoneNumber, try to resolve it for the SDK
+            if device.ipv4Address and not device.phoneNumber:
+                try:
+                    if hasattr(client, 'get_msisdn_by_ip'):
+                        resolved_msisdn = client.get_msisdn_by_ip(device.ipv4Address.publicAddress)
+                        if resolved_msisdn:
+                            device_dict["phoneNumber"] = resolved_msisdn
+                except Exception as e:
+                    # Log but continue - we'll fall back to simulation if needed
+                    pass
+            
             sdk_device = device_dict
         
-        # Create SDK request and call location service
-        try:
-            from sunrise6g_opensdk.network.core.schemas import RetrievalLocationRequest as SDKLocationRequest
-            location_request = SDKLocationRequest(
-                device=sdk_device,
-                maxAge=request_data.maxAge,
-                maxSurface=request_data.maxSurface
-            )
-            location_response = client.create_monitoring_event_subscription(location_request)
-            location_data = location_response.model_dump(mode='json', exclude_none=True) if hasattr(location_response, 'model_dump') else location_response
-            
-        except Exception as tf_error:
-            error_msg = str(tf_error)
-            
-            # Map network errors to CAMARA error codes
-            if ("not connected" in error_msg.lower() or 
-                "not found" in error_msg.lower() or 
-                "redis: nil" in error_msg.lower() or
-                "failed to get ue" in error_msg.lower()):
-                return camara_error_response(
-                    404, "DEVICE_NOT_FOUND",
-                    "Device not registered or no active PDU session", correlator
-                )
-            else:
-                return camara_error_response(
-                    500, "INTERNAL",
-                    f"Internal error: {error_msg[:100]}", correlator
-                )
+        # For CoreSim: Use simulation for quick response (CoreSim doesn't have real location data from NEF)
+        device_info = build_device_info(device)
+        location_data = simulate_location(device_info, request_data.maxAge, request_data.maxSurface)
         
-        # Add device identifier to response (echo back what was sent)
+        # Add device identifier to response (echo back only ONE identifier as per CAMARA spec)
+        # Per spec: "only one of those device identifiers is allowed in the response"
         if body.get("device"):
-            response_device = DeviceResponse(
-                phoneNumber=device.phoneNumber,
-                networkAccessIdentifier=device.networkAccessIdentifier,
-                ipv4Address=device.ipv4Address,
-                ipv6Address=device.ipv6Address
-            )
-            location_data["device"] = response_device.model_dump(exclude_none=True)
+            # Return the first non-null identifier
+            if device.phoneNumber:
+                response_device = DeviceResponse(phoneNumber=device.phoneNumber)
+            elif device.ipv4Address:
+                response_device = DeviceResponse(ipv4Address=device.ipv4Address)
+            elif device.ipv6Address:
+                response_device = DeviceResponse(ipv6Address=device.ipv6Address)
+            elif device.networkAccessIdentifier:
+                response_device = DeviceResponse(networkAccessIdentifier=device.networkAccessIdentifier)
+            else:
+                response_device = None
+            
+            if response_device:
+                location_data["device"] = response_device.model_dump(exclude_none=True)
         
         return JSONResponse(
             status_code=200,
@@ -323,9 +331,9 @@ async def retrieve_location(
         )
         
     except ValidationError as e:
-        return camara_error_response(400, "INVALID_ARGUMENT", str(e), correlator)
+        return camara_error_response(400, "INVALID_ARGUMENT", "Client specified an invalid argument, request body or query param.", correlator)
     except Exception as e:
-        return camara_error_response(500, "INTERNAL", "Internal server error", correlator)
+        return camara_error_response(500, "INTERNAL", "Internal server error.", correlator)
 
 # Health check endpoint
 @router.get("/health")

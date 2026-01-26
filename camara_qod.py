@@ -10,6 +10,7 @@ from typing import Optional, List
 from datetime import datetime, timedelta
 import uuid
 import json
+from mongodb_client import get_mongo_client
 
 router = APIRouter(prefix="/quality-on-demand/v1", tags=["CAMARA QoD"])
 
@@ -60,19 +61,19 @@ class RetrieveSessionsInput(BaseModel):
     device: Device
 
 class SessionInfo(BaseModel):
-    sessionId: str
-    duration: int
-    qosProfile: str
     device: Optional[Device] = None
     applicationServer: ApplicationServer
     devicePorts: Optional[PortsSpec] = None
     applicationServerPorts: Optional[PortsSpec] = None
-    qosStatus: str
-    statusInfo: Optional[str] = None
-    startedAt: Optional[str] = None
-    expiresAt: Optional[str] = None
+    qosProfile: str
     sink: Optional[str] = None
     sinkCredential: Optional[SinkCredential] = None
+    sessionId: str
+    duration: int
+    startedAt: Optional[str] = None
+    expiresAt: Optional[str] = None
+    qosStatus: str
+    statusInfo: Optional[str] = None
 
 # In-memory session storage
 qod_sessions = {}
@@ -124,14 +125,14 @@ async def create_qod_session(
         body = await raw_request.json()
         session_request = CreateSession(**body)
     except ValidationError as e:
-        return camara_error_response(400, "INVALID_ARGUMENT", str(e), correlator)
+        return camara_error_response(400, "INVALID_ARGUMENT", "Client specified an invalid argument, request body or query param.", correlator)
     except Exception as e:
-        return camara_error_response(400, "INVALID_ARGUMENT", f"Invalid JSON: {str(e)}", correlator)
+        return camara_error_response(400, "INVALID_ARGUMENT", "Client specified an invalid argument, request body or query param.", correlator)
     
     # Get network client
     client = get_client(core)
     if client is None:
-        return camara_error_response(503, "SERVICE_UNAVAILABLE", f"Core '{core}' not available", correlator)
+        return camara_error_response(500, "INTERNAL", "Internal server error.", correlator)
     
     # Build session_info for SDK with proper device format
     try:
@@ -183,38 +184,60 @@ async def create_qod_session(
         
     except Exception as tf_error:
         error_msg = str(tf_error)
+        print(f"QoD Session Creation Error: {error_msg}")
+        print(f"Error type: {type(tf_error).__name__}")
+        import traceback
+        traceback.print_exc()
         # Map network errors to CAMARA error codes
         if "not connected" in error_msg.lower() or "not found" in error_msg.lower():
-            return camara_error_response(404, "DEVICE_NOT_FOUND", 
-                "Device not registered or no active PDU session", correlator)
+            return camara_error_response(404, "IDENTIFIER_NOT_FOUND", 
+                "Device identifier not found.", correlator)
         elif "invalid" in error_msg.lower():
-            return camara_error_response(400, "INVALID_DEVICE_IDENTIFIER",
-                f"Invalid device identifier: {error_msg[:100]}", correlator)
+            return camara_error_response(400, "INVALID_ARGUMENT",
+                "Client specified an invalid argument, request body or query param.", correlator)
         else:
             return camara_error_response(500, "INTERNAL",
-                f"Internal error: {error_msg[:100]}", correlator)
+                "Internal server error.", correlator)
         
     # Create session response
     session_id = str(uuid.uuid4())
-    now = datetime.utcnow()
-    expires_at = now + timedelta(seconds=session_request.duration)
     
+    # Per CAMARA spec: initially return REQUESTED status
+    # Session becomes AVAILABLE after network confirmation
     session_data = SessionInfo(
-        sessionId=session_id,
-        duration=session_request.duration,
-        qosProfile=session_request.qosProfile,
         device=session_request.device,
         applicationServer=session_request.applicationServer,
         devicePorts=session_request.devicePorts,
         applicationServerPorts=session_request.applicationServerPorts,
-        qosStatus="AVAILABLE",
-        startedAt=now.isoformat() + "Z",
-        expiresAt=expires_at.isoformat() + "Z",
+        qosProfile=session_request.qosProfile,
         sink=session_request.sink,
-        sinkCredential=session_request.sinkCredential
+        sinkCredential=session_request.sinkCredential,
+        sessionId=session_id,
+        duration=session_request.duration,
+        qosStatus="REQUESTED",
+        # startedAt and expiresAt are not included when qosStatus is REQUESTED
+        startedAt=None,
+        expiresAt=None,
+        statusInfo=None
     )
     
     qod_sessions[session_id] = session_data
+    
+    # Save to MongoDB (only successful responses, no errors)
+    try:
+        mongo_client = get_mongo_client()
+        mongo_client.save_qod_session(
+            session_id=session_id,
+            operation="CREATE",
+            request_data=body,
+            response_data=session_data.model_dump(exclude_none=True),
+            status_code=201,
+            device=session_request.device.model_dump(exclude_none=True) if session_request.device else None,
+            qos_profile=session_request.qosProfile,
+        )
+    except Exception as mongo_error:
+        # Log error but don't fail the request
+        print(f"MongoDB save error: {mongo_error}")
     
     # Return 201 Created with session info
     return JSONResponse(
@@ -239,9 +262,24 @@ async def get_qod_session(
     response.headers["x-correlator"] = correlator
     
     if sessionId not in qod_sessions:
-        return camara_error_response(404, "NOT_FOUND", "Session not found", correlator)
+        return camara_error_response(404, "NOT_FOUND", "The specified resource is not found.", correlator)
     
-    return qod_sessions[sessionId]
+    session_data = qod_sessions[sessionId]
+    
+    # Save GET operation to MongoDB
+    try:
+        mongo_client = get_mongo_client()
+        mongo_client.save_qod_session(
+            session_id=sessionId,
+            operation="GET",
+            request_data={"sessionId": sessionId},
+            response_data=session_data.model_dump(exclude_none=True),
+            status_code=200,
+        )
+    except Exception as mongo_error:
+        print(f"MongoDB save error: {mongo_error}")
+    
+    return session_data
 
 
 @router.delete("/sessions/{sessionId}", status_code=204)
@@ -259,15 +297,30 @@ async def delete_qod_session(
     response.headers["x-correlator"] = correlator
     
     if sessionId not in qod_sessions:
-        return camara_error_response(404, "NOT_FOUND", "Session not found", correlator)
+        return camara_error_response(404, "NOT_FOUND", "The specified resource is not found.", correlator)
     
     session = qod_sessions[sessionId]
+    session_data_before_delete = session.model_dump(exclude_none=True)
     session.qosStatus = "UNAVAILABLE"
     session.statusInfo = "DELETE_REQUESTED"
     del qod_sessions[sessionId]
     
-    # 204 No Content - return None
-    return None
+    # Save DELETE operation to MongoDB
+    try:
+        mongo_client = get_mongo_client()
+        mongo_client.save_qod_session(
+            session_id=sessionId,
+            operation="DELETE",
+            request_data={"sessionId": sessionId},
+            response_data=session_data_before_delete,
+            status_code=204,
+        )
+    except Exception as mongo_error:
+        print(f"MongoDB save error: {mongo_error}")
+    
+    # 204 No Content - FastAPI handles this automatically with status_code=204
+    response.headers["x-correlator"] = correlator
+    return Response(status_code=204, headers={"x-correlator": correlator})
 
 
 @router.post("/sessions/{sessionId}/extend", response_model=SessionInfo)
@@ -286,7 +339,7 @@ async def extend_qod_session(
     response.headers["x-correlator"] = correlator
     
     if sessionId not in qod_sessions:
-        return camara_error_response(404, "NOT_FOUND", "Session not found", correlator)
+        return camara_error_response(404, "NOT_FOUND", "The specified resource is not found.", correlator)
     
     session = qod_sessions[sessionId]
     
@@ -294,7 +347,7 @@ async def extend_qod_session(
         return camara_error_response(
             409,
             "QUALITY_ON_DEMAND.SESSION_EXTENSION_NOT_ALLOWED",
-            f"Cannot extend session in {session.qosStatus} state",
+            f"Extending the session duration is not allowed in the current state ({session.qosStatus}). The session must be in the AVAILABLE state.",
             correlator
         )
     

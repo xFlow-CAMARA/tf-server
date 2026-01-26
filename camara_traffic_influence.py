@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 import uuid
 import json
+from mongodb_client import get_mongo_client
 
 router = APIRouter(prefix="/traffic-influence/vwip", tags=["CAMARA Traffic Influence"])
 
@@ -51,18 +52,29 @@ class DeviceIpv4Addr(BaseModel):
     publicPort: Optional[int] = Field(None, ge=0, le=65535)
 
 class Device(BaseModel):
-    """Device identifier"""
+    """Device identifier - at least one field required"""
     phoneNumber: Optional[str] = Field(None, pattern=r'^\+[1-9][0-9]{4,14}$')
     networkAccessIdentifier: Optional[str] = None
     ipv4Address: Optional[DeviceIpv4Addr] = None
     ipv6Address: Optional[str] = None
+    
+    def model_post_init(self, __context):
+        """Validate that at least one identifier is provided (minProperties: 1)"""
+        if not any([self.phoneNumber, self.networkAccessIdentifier, self.ipv4Address, self.ipv6Address]):
+            raise ValueError("At least one device identifier must be provided")
 
 class DeviceResponse(BaseModel):
-    """Single device identifier in response"""
+    """Single device identifier in response - maxProperties: 1"""
     phoneNumber: Optional[str] = None
     networkAccessIdentifier: Optional[str] = None
     ipv4Address: Optional[DeviceIpv4Addr] = None
     ipv6Address: Optional[str] = None
+    
+    def model_post_init(self, __context):
+        """Ensure only one device identifier is provided (maxProperties: 1)"""
+        identifiers = [self.phoneNumber, self.networkAccessIdentifier, self.ipv4Address, self.ipv6Address]
+        if sum(x is not None for x in identifiers) > 1:
+            raise ValueError("Only one device identifier can be returned")
 
 class SourceTrafficFilters(BaseModel):
     """Source traffic filters"""
@@ -200,9 +212,8 @@ async def get_all_traffic_influences(
     correlator = get_correlator(x_correlator)
     response.headers["x-correlator"] = correlator
     
+    # Get client (optional for simulation)
     client = get_client(core)
-    if client is None:
-        return camara_error_response(503, "SERVICE_UNAVAILABLE", f"Core '{core}' not available", correlator)
     
     results = []
     for ti_id, ti_data in traffic_influences.items():
@@ -237,9 +248,8 @@ async def create_traffic_influence(
         body = await raw_request.json()
         request_data = PostTrafficInfluence(**body)
         
+        # Get client (optional for simulation)
         client = get_client(core)
-        if client is None:
-            return camara_error_response(503, "SERVICE_UNAVAILABLE", f"Core '{core}' not available", correlator)
         
         # Build traffic influence info for SDK
         ti_info = {
@@ -264,8 +274,7 @@ async def create_traffic_influence(
             sdk_response = client.create_traffic_influence_resource(ti_info)
             resource_id = sdk_response.get("trafficInfluenceID") or str(uuid.uuid4())
         except Exception as tf_error:
-            error_msg = str(tf_error)
-            return camara_error_response(500, "INTERNAL", f"Internal error: {error_msg[:100]}", correlator)
+            return camara_error_response(500, "INTERNAL", "Internal server error.", correlator)
         
         # Add Location header as per CAMARA spec
         response.headers["Location"] = f"/traffic-influence/vwip/traffic-influences/{resource_id}"
@@ -294,6 +303,30 @@ async def create_traffic_influence(
         
         # Store resource
         traffic_influences[resource_id] = ti_resource
+
+        # Save CREATE operation to MongoDB
+        try:
+            traffic_filters: List[Dict[str, Any]] = []
+            filter_record: Dict[str, Any] = {}
+            if request_data.sourceTrafficFilters:
+                filter_record["sourceTrafficFilters"] = request_data.sourceTrafficFilters.model_dump()
+            if request_data.destinationTrafficFilters:
+                filter_record["destinationTrafficFilters"] = request_data.destinationTrafficFilters.model_dump()
+            if filter_record:
+                traffic_filters.append(filter_record)
+
+            mongo_client = get_mongo_client()
+            mongo_client.save_traffic_influence(
+                traffic_influence_id=resource_id,
+                operation="CREATE",
+                request_data=body,
+                response_data=ti_resource,
+                status_code=201,
+                device=None,
+                traffic_filters=traffic_filters,
+            )
+        except Exception as mongo_error:
+            print(f"MongoDB save error: {mongo_error}")
         
         return JSONResponse(
             status_code=201,
@@ -305,9 +338,9 @@ async def create_traffic_influence(
         )
         
     except ValidationError as e:
-        return camara_error_response(400, "INVALID_ARGUMENT", f"Invalid request: {str(e)}", correlator)
+        return camara_error_response(400, "INVALID_ARGUMENT", "Client specified an invalid argument, request body or query param.", correlator)
     except Exception as e:
-        return camara_error_response(500, "INTERNAL", "Internal server error", correlator)
+        return camara_error_response(500, "INTERNAL", "Internal server error.", correlator)
 
 
 @router.post("/traffic-influence-devices", status_code=201, response_model=TrafficInfluence)
@@ -334,11 +367,10 @@ async def create_traffic_influence_device(
         # Validate device is provided
         if not request_data.device:
             return camara_error_response(422, "MISSING_IDENTIFIER", 
-                "Device identifier is required for this endpoint", correlator)
+                "The phone number cannot be identified.", correlator)
         
+        # Get client (optional for simulation)
         client = get_client(core)
-        if client is None:
-            return camara_error_response(503, "SERVICE_UNAVAILABLE", f"Core '{core}' not available", correlator)
         
         # Build traffic influence info for SDK with proper device format
         ti_info = {
@@ -403,11 +435,11 @@ async def create_traffic_influence_device(
                 "redis: nil" in error_msg.lower() or
                 "failed to get ue" in error_msg.lower() or
                 "could not create pcf policy" in error_msg.lower()):
-                return camara_error_response(404, "DEVICE_NOT_FOUND",
-                    "Device not registered or no active PDU session", correlator)
+                return camara_error_response(404, "IDENTIFIER_NOT_FOUND",
+                    "Device identifier not found.", correlator)
             else:
                 return camara_error_response(500, "INTERNAL",
-                    f"Internal error: {error_msg[:100]}", correlator)
+                    "Internal server error.", correlator)
         
         # Add Location header as per CAMARA spec
         response.headers["Location"] = f"/traffic-influence/vwip/traffic-influences/{resource_id}"
@@ -437,6 +469,30 @@ async def create_traffic_influence_device(
         
         # Store resource
         traffic_influences[resource_id] = ti_resource
+
+        # Save CREATE operation to MongoDB
+        try:
+            traffic_filters: List[Dict[str, Any]] = []
+            filter_record: Dict[str, Any] = {}
+            if request_data.sourceTrafficFilters:
+                filter_record["sourceTrafficFilters"] = request_data.sourceTrafficFilters.model_dump()
+            if request_data.destinationTrafficFilters:
+                filter_record["destinationTrafficFilters"] = request_data.destinationTrafficFilters.model_dump()
+            if filter_record:
+                traffic_filters.append(filter_record)
+
+            mongo_client = get_mongo_client()
+            mongo_client.save_traffic_influence(
+                traffic_influence_id=resource_id,
+                operation="CREATE",
+                request_data=body,
+                response_data=ti_resource,
+                status_code=201,
+                device=request_data.device.model_dump(exclude_none=True),
+                traffic_filters=traffic_filters,
+            )
+        except Exception as mongo_error:
+            print(f"MongoDB save error: {mongo_error}")
         
         return JSONResponse(
             status_code=201,
@@ -448,9 +504,9 @@ async def create_traffic_influence_device(
         )
         
     except ValidationError as e:
-        return camara_error_response(400, "INVALID_ARGUMENT", f"Invalid request: {str(e)}", correlator)
+        return camara_error_response(400, "INVALID_ARGUMENT", "Client specified an invalid argument, request body or query param.", correlator)
     except Exception as e:
-        return camara_error_response(500, "INTERNAL", "Internal server error", correlator)
+        return camara_error_response(500, "INTERNAL", "Internal server error.", correlator)
 
 
 @router.get("/traffic-influences/{trafficInfluenceID}", response_model=TrafficInfluence)
@@ -470,17 +526,30 @@ async def get_traffic_influence_by_id(
     correlator = get_correlator(x_correlator)
     response.headers["x-correlator"] = correlator
     
+    # Get client (optional for simulation)
     client = get_client(core)
-    if client is None:
-        return camara_error_response(503, "SERVICE_UNAVAILABLE", f"Core '{core}' not available", correlator)
     
     if trafficInfluenceID not in traffic_influences:
-        return camara_error_response(404, "NOT_FOUND", 
-            f"Traffic influence resource {trafficInfluenceID} not found", correlator)
+        return camara_error_response(404, "IDENTIFIER_NOT_FOUND", 
+            "The Traffic Influence resource identifier is unknown.", correlator)
     
     # Return without device info for privacy
     ti_data = traffic_influences[trafficInfluenceID].copy()
     ti_data.pop("device", None)
+    
+    # Save GET operation to MongoDB
+    try:
+        mongo_client = get_mongo_client()
+        mongo_client.save_traffic_influence(
+            traffic_influence_id=trafficInfluenceID,
+            operation="GET",
+            request_data={"trafficInfluenceID": trafficInfluenceID},
+            response_data=ti_data,
+            status_code=200,
+        )
+    except Exception as mongo_error:
+        print(f"MongoDB save error: {mongo_error}")
+    
     return ti_data
 
 
@@ -504,8 +573,8 @@ async def patch_traffic_influence(
     
     try:
         if trafficInfluenceID not in traffic_influences:
-            return camara_error_response(404, "NOT_FOUND",
-                f"Traffic influence resource {trafficInfluenceID} not found", correlator)
+            return camara_error_response(404, "IDENTIFIER_NOT_FOUND",
+                "The Traffic Influence resource identifier is unknown.", correlator)
         
         ti_resource = traffic_influences[trafficInfluenceID]
         
@@ -515,7 +584,7 @@ async def patch_traffic_influence(
         # Check if resource is active
         if ti_resource["state"] != TrafficInfluenceState.ACTIVE.value:
             return camara_error_response(409, "DENIED_WAIT",
-                "Resource must be in 'active' state before modification", correlator)
+                "It is not possible to modify the Traffic Influence resource because it is still under provisioning. The resource can be modified when it is fully implemented and activated. Please wait for the resource status (state) to be \"active\" before trying to update it.", correlator)
         
         body = await raw_request.json()
         patch_data = PatchTrafficInfluence(**body)
@@ -553,12 +622,26 @@ async def patch_traffic_influence(
         # Return without device info
         result_data = ti_resource.copy()
         result_data.pop("device", None)
+
+        # Save UPDATE operation to MongoDB
+        try:
+            mongo_client = get_mongo_client()
+            mongo_client.save_traffic_influence(
+                traffic_influence_id=trafficInfluenceID,
+                operation="UPDATE",
+                request_data=body,
+                response_data=result_data,
+                status_code=200,
+            )
+        except Exception as mongo_error:
+            print(f"MongoDB save error: {mongo_error}")
+
         return result_data
         
     except ValidationError as e:
-        return camara_error_response(400, "INVALID_ARGUMENT", f"Invalid request: {str(e)}", correlator)
+        return camara_error_response(400, "INVALID_ARGUMENT", "Client specified an invalid argument, request body or query param.", correlator)
     except Exception as e:
-        return camara_error_response(500, "INTERNAL", "Internal server error", correlator)
+        return camara_error_response(500, "INTERNAL", "Internal server error.", correlator)
 
 
 @router.delete("/traffic-influences/{trafficInfluenceID}", status_code=202)
@@ -577,17 +660,30 @@ async def delete_traffic_influence(
     correlator = get_correlator(x_correlator)
     response.headers["x-correlator"] = correlator
     
+    # Get client (optional for simulation)
     client = get_client(core)
-    if client is None:
-        return camara_error_response(503, "SERVICE_UNAVAILABLE", f"Core '{core}' not available", correlator)
     
     if trafficInfluenceID not in traffic_influences:
-        return camara_error_response(404, "NOT_FOUND",
-            f"Traffic influence resource {trafficInfluenceID} not found", correlator)
+        return camara_error_response(404, "IDENTIFIER_NOT_FOUND",
+            "The Traffic Influence resource identifier is unknown.", correlator)
     
     # Mark as deletion in progress, then delete
+    ti_data_before_delete = traffic_influences[trafficInfluenceID].copy()
     traffic_influences[trafficInfluenceID]["state"] = TrafficInfluenceState.DELETION_IN_PROGRESS.value
     del traffic_influences[trafficInfluenceID]
+    
+    # Save DELETE operation to MongoDB
+    try:
+        mongo_client = get_mongo_client()
+        mongo_client.save_traffic_influence(
+            traffic_influence_id=trafficInfluenceID,
+            operation="DELETE",
+            request_data={"trafficInfluenceID": trafficInfluenceID},
+            response_data=ti_data_before_delete,
+            status_code=202,
+        )
+    except Exception as mongo_error:
+        print(f"MongoDB save error: {mongo_error}")
     
     # Return empty 202 response per CAMARA spec
     return JSONResponse(status_code=202, content={}, headers={"x-correlator": correlator})

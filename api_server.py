@@ -21,6 +21,9 @@ import subprocess
 
 app = FastAPI(title="TF-SDK API Server", version="1.0.0")
 
+# Import MongoDB logger middleware
+from mongodb_logger import MongoDBLoggerMiddleware
+
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
@@ -30,18 +33,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add MongoDB logging middleware
+app.add_middleware(MongoDBLoggerMiddleware)
+
 # Import CAMARA routers
 import camara_qod
 import camara_location
 import camara_traffic_influence
 import camara_number_verification
 import camara_device_status
+import camara_sim_swap
+import camara_history
 
 app.include_router(camara_qod.router)
 app.include_router(camara_location.router)
 app.include_router(camara_traffic_influence.router)
 app.include_router(camara_number_verification.router)
 app.include_router(camara_device_status.router)
+app.include_router(camara_sim_swap.router)
+app.include_router(camara_history.router)
 
 # Store multiple network clients for different 5G cores
 network_clients = {}
@@ -105,6 +115,7 @@ camara_location.network_clients = network_clients
 camara_traffic_influence.network_clients = network_clients
 camara_number_verification.network_clients = network_clients
 camara_device_status.network_clients = network_clients
+camara_sim_swap.network_clients = network_clients
 
 def get_client(core: str = "coresim"):
     """Get network client for specified core"""
@@ -632,7 +643,32 @@ async def update_core_config(core_name: str, config: dict):
         with open(config_path, 'w') as f:
             yaml.dump(existing_config, f, default_flow_style=False, sort_keys=False)
         
-        return {"success": True, "message": "Configuration updated successfully"}
+        print(f"[Config Update] Configuration file updated successfully")
+        
+        # Restart core-simulator container to apply new config
+        try:
+            import subprocess
+            print(f"[Config Update] Attempting to restart core-simulator container...")
+            result = subprocess.run(
+                ['docker', 'restart', 'core-simulator'],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                print(f"[Config Update] Successfully restarted core-simulator container")
+                return {"success": True, "message": "Configuration updated and core-simulator restarted successfully"}
+            else:
+                print(f"[Config Update] Restart failed with code {result.returncode}: {result.stderr}")
+                return {"success": True, "message": f"Configuration updated but restart failed: {result.stderr}", "restart_failed": True}
+                
+        except subprocess.TimeoutExpired:
+            print(f"[Config Update] Restart command timed out")
+            return {"success": True, "message": "Configuration updated but restart timed out. Please restart manually.", "restart_failed": True}
+        except Exception as restart_error:
+            print(f"[Config Update] Restart exception: {str(restart_error)}")
+            return {"success": True, "message": f"Configuration updated but restart failed: {str(restart_error)}", "restart_failed": True}
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update config: {str(e)}")
@@ -995,6 +1031,8 @@ def get_camara_api_releases() -> Dict[str, str]:
         "deviceLocation": get_github_latest_release("camaraproject/DeviceLocation"),
         "trafficInfluence": get_github_latest_release("camaraproject/TrafficInfluence"),
         "numberVerification": get_github_latest_release("camaraproject/NumberVerification"),
+        "deviceStatus": get_github_latest_release("camaraproject/DeviceStatus"),
+        "simSwap": get_github_latest_release("camaraproject/SimSwap"),
     }
     
     # Update cache
@@ -1293,9 +1331,9 @@ async def get_registered_services(filter_camara: bool = True):
         "apiName": "TF-SDK API Gateway",
         "version": "v1",
         "baseUrl": tf_sdk_base,
-        "description": "CAMARA API Gateway powered by TF-SDK - QoD, Location, Traffic Influence, Number Verification",
+        "description": "CAMARA API Gateway powered by TF-SDK - QoD, Location, Traffic Influence, Number Verification, Device Status, SIM Swap",
         "apiType": "CAMARA",
-        "release": f"CAMARA (QoD: {camara_releases.get('qualityOnDemand', 'latest')}, Location: {camara_releases.get('deviceLocation', 'latest')}, Traffic: {camara_releases.get('trafficInfluence', 'latest')}, NumberVerify: {camara_releases.get('numberVerification', 'latest')})",
+        "release": f"CAMARA (QoD: {camara_releases.get('qualityOnDemand', 'latest')}, Location: {camara_releases.get('deviceLocation', 'latest')}, Traffic: {camara_releases.get('trafficInfluence', 'latest')}, NumberVerify: {camara_releases.get('numberVerification', 'latest')}, DeviceStatus: {camara_releases.get('deviceStatus', 'latest')}, SimSwap: {camara_releases.get('simSwap', 'latest')})",
         "specUrl": None,  # Use individual CAMARA API specs below
         "camaraApis": {
             "qualityOnDemand": {
@@ -1317,6 +1355,21 @@ async def get_registered_services(filter_camara: bool = True):
                 "spec": "https://github.com/camaraproject/NumberVerification",
                 "openapi": "https://github.com/camaraproject/NumberVerification/blob/main/code/API_definitions/number-verification.yaml",
                 "release": camara_releases.get("numberVerification", "latest")
+            },
+            "deviceReachabilityStatus": {
+                "spec": "https://github.com/camaraproject/DeviceStatus",
+                "openapi": "https://github.com/camaraproject/DeviceStatus/blob/main/code/API_definitions/device-reachability-status.yaml",
+                "release": camara_releases.get("deviceStatus", "latest")
+            },
+            "deviceRoamingStatus": {
+                "spec": "https://github.com/camaraproject/DeviceStatus",
+                "openapi": "https://github.com/camaraproject/DeviceStatus/blob/main/code/API_definitions/device-roaming-status.yaml",
+                "release": camara_releases.get("deviceStatus", "latest")
+            },
+            "simSwap": {
+                "spec": "https://github.com/camaraproject/SimSwap",
+                "openapi": "https://github.com/camaraproject/SimSwap/blob/main/code/API_definitions/sim-swap.yaml",
+                "release": camara_releases.get("simSwap", "latest")
             }
         },
         "endpoints": {
@@ -1369,6 +1422,40 @@ async def get_registered_services(filter_camara: bool = True):
                 "path": "/number-verification/v0/device-phone-number",
                 "description": "Get phone number associated with device IP",
                 "interactsWith": ["ue-identity-service", "Redis"]
+            },
+            "deviceReachabilityRetrieve": {
+                "method": "POST",
+                "path": "/device-status/reachability/v1/retrieve",
+                "description": "Get device reachability status (DATA/SMS connectivity)",
+                "interactsWith": ["CoreSim", "Prometheus Metrics"]
+            },
+            "deviceRoamingRetrieve": {
+                "method": "POST",
+                "path": "/device-status/roaming/v1/retrieve",
+                "description": "Get device roaming status and country",
+                "interactsWith": ["CoreSim", "PLMN Registry"]
+            },
+            "deviceReachabilitySubscribe": {
+                "method": "POST",
+                "path": "/device-status/reachability/v1/subscriptions",
+                "description": "Subscribe to reachability status changes"
+            },
+            "deviceRoamingSubscribe": {
+                "method": "POST",
+                "path": "/device-status/roaming/v1/subscriptions",
+                "description": "Subscribe to roaming status changes"
+            },
+            "simSwapCheck": {
+                "method": "POST",
+                "path": "/sim-swap/vwip/check",
+                "description": "Check if SIM swap occurred during a specified period",
+                "interactsWith": ["SIM Swap Database", "Fraud Detection"]
+            },
+            "simSwapRetrieveDate": {
+                "method": "POST",
+                "path": "/sim-swap/vwip/retrieve-date",
+                "description": "Get timestamp of the latest SIM swap event",
+                "interactsWith": ["SIM Swap Database", "Fraud Detection"]
             }
         }
     })
@@ -1695,6 +1782,229 @@ async def get_registered_services(filter_camara: bool = True):
         return filtered_services
     
     return services
+
+
+@app.get("/metrics")
+async def get_api_metrics(api: str):
+    """Get API metrics from MongoDB"""
+    try:
+        from mongodb_logger import MongoDBLoggerMiddleware
+        from pymongo import MongoClient
+        from datetime import datetime, timedelta
+        
+        # Connect to MongoDB
+        mongo_uri = os.getenv("MONGODB_URI", "mongodb://mongodb:27017")
+        mongo_db = os.getenv("MONGODB_DB", "camara")
+        client = MongoClient(mongo_uri)
+        db = client[mongo_db]
+        
+        # Calculate time range (last 24 hours)
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(hours=24)
+        
+        # Query api_usage_logs for the specific API
+        logs = db.api_usage_logs.find({
+            "api_name": api,
+            "timestamp": {"$gte": start_time, "$lte": end_time}
+        })
+        
+        total_requests = 0
+        success_count = 0
+        error_count = 0
+        total_latency = 0
+        
+        for log in logs:
+            total_requests += 1
+            status_code = log.get("status_code", 500)
+            if 200 <= status_code < 400:
+                success_count += 1
+            else:
+                error_count += 1
+            total_latency += log.get("latency_ms", 0)
+        
+        avg_latency_ms = total_latency / total_requests if total_requests > 0 else 0
+        error_rate = (error_count / total_requests * 100) if total_requests > 0 else 0
+        
+        client.close()
+        
+        return {
+            "api_name": api,
+            "total_requests": total_requests,
+            "success_count": success_count,
+            "error_count": error_count,
+            "avg_latency_ms": round(avg_latency_ms, 2),
+            "error_rate": round(error_rate, 2),
+            "time_range": "Last 24 hours"
+        }
+    except Exception as e:
+        print(f"Error fetching metrics: {e}")
+        return {
+            "api_name": api,
+            "total_requests": 0,
+            "success_count": 0,
+            "error_count": 0,
+            "avg_latency_ms": 0,
+            "error_rate": 0,
+            "error": str(e)
+        }
+
+
+@app.post("/metrics/reset")
+async def reset_api_metrics(api: str):
+    """Reset API metrics by deleting logs from MongoDB"""
+    try:
+        from pymongo import MongoClient
+        
+        # Connect to MongoDB
+        mongo_uri = os.getenv("MONGODB_URI", "mongodb://mongodb:27017")
+        mongo_db = os.getenv("MONGODB_DB", "camara")
+        client = MongoClient(mongo_uri)
+        db = client[mongo_db]
+        
+        # Delete logs for the specific API
+        logs_result = db.api_usage_logs.delete_many({"api_name": api})
+        
+        # Delete hourly metrics for the specific API
+        metrics_result = db.api_metrics_hourly.delete_many({"api_name": api})
+        
+        client.close()
+        
+        return {
+            "api_name": api,
+            "status": "success",
+            "logs_deleted": logs_result.deleted_count,
+            "metrics_deleted": metrics_result.deleted_count,
+            "message": f"Reset metrics for {api}"
+        }
+    except Exception as e:
+        print(f"Error resetting metrics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/logs")
+async def get_api_logs(api: str, limit: int = 20):
+    """Get recent API logs from MongoDB"""
+    try:
+        from pymongo import MongoClient
+        from datetime import datetime
+        
+        # Connect to MongoDB
+        mongo_uri = os.getenv("MONGODB_URI", "mongodb://mongodb:27017")
+        mongo_db = os.getenv("MONGODB_DB", "camara")
+        client = MongoClient(mongo_uri)
+        db = client[mongo_db]
+        
+        # Query recent logs for the specific API
+        logs = list(db.api_usage_logs.find(
+            {"api_name": api}
+        ).sort("timestamp", -1).limit(limit))
+        
+        client.close()
+        
+        # Convert ObjectId to string for JSON serialization
+        for log in logs:
+            log["_id"] = str(log["_id"])
+            if "timestamp" in log:
+                log["timestamp"] = log["timestamp"].isoformat()
+        
+        return {
+            "api_name": api,
+            "logs": logs,
+            "count": len(logs)
+        }
+    except Exception as e:
+        print(f"Error fetching logs: {e}")
+        return {
+            "api_name": api,
+            "logs": [],
+            "count": 0,
+            "error": str(e)
+        }
+
+
+@app.get("/core-logs")
+async def get_core_logs(services: str, lines: int = 50, api: str = None):
+    """Get logs from core network services filtered by API context"""
+    import subprocess
+    import re
+    
+    # Define API-specific keywords for filtering logs
+    api_keywords = {
+        'qod': ['qos', 'quality', 'session', 'bandwidth', 'latency', 'throughput', 'guaranteed', 'flow'],
+        'location': ['location', 'geolocation', 'position', 'monitoring', 'ue-location', 'subscription'],
+        'traffic-influence': ['traffic', 'influence', 'routing', 'dnai', 'route', 'af-routing'],
+        'number-verification': ['verification', 'phone', 'msisdn', 'number', 'verify', 'identity'],
+        'device-status': ['device', 'status', 'connectivity', 'roaming', 'reachability'],
+        'sim-swap': ['sim', 'swap', 'change', 'replace', 'iccid', 'profile', 'subscriber', 'supi', 'gpsi', 'msisdn', 'imsi', 'ue']
+    }
+    
+    try:
+        service_list = services.split(',')
+        all_logs = []
+        
+        # Get more lines from docker to have enough after filtering
+        fetch_lines = lines * 5 if api else lines
+        
+        for service in service_list:
+            service = service.strip()
+            try:
+                # Run docker logs command
+                result = subprocess.run(
+                    ['docker', 'logs', service, '--tail', str(fetch_lines)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                
+                log_output = result.stdout + result.stderr
+                log_lines = [line for line in log_output.split('\n') if line.strip()]
+                
+                for line in log_lines:
+                    # If API filter is specified, check if log line contains relevant keywords
+                    if api:
+                        api_lower = api.lower()
+                        keywords = api_keywords.get(api_lower, [])
+                        line_lower = line.lower()
+                        
+                        # Check if line contains any API-specific keywords
+                        if not any(keyword in line_lower for keyword in keywords):
+                            # Also include ERROR and WARN logs regardless
+                            if not re.search(r'\b(ERROR|WARN|FATAL)\b', line, re.IGNORECASE):
+                                continue
+                    
+                    # Try to extract timestamp
+                    timestamp_match = re.search(r'\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}', line)
+                    level_match = re.search(r'\b(ERROR|WARN|INFO|DEBUG|FATAL)\b', line, re.IGNORECASE)
+                    
+                    timestamp = timestamp_match.group(0).replace('T', ' ')[11:19] if timestamp_match else datetime.now().strftime('%H:%M:%S')
+                    
+                    all_logs.append({
+                        'timestamp': timestamp,
+                        'service': service,
+                        'message': line,
+                        'level': level_match.group(1) if level_match else None
+                    })
+                    
+            except subprocess.TimeoutExpired:
+                print(f"Timeout fetching logs for {service}")
+            except Exception as e:
+                print(f"Error fetching logs for {service}: {e}")
+        
+        # Sort by timestamp (most recent first)
+        all_logs.reverse()
+        
+        return {
+            'logs': all_logs[:lines],
+            'count': len(all_logs),
+            'filtered_by_api': api is not None
+        }
+    except Exception as e:
+        print(f"Error in core-logs endpoint: {e}")
+        return {
+            'logs': [],
+            'count': 0,
+            'error': str(e)
+        }
 
 
 if __name__ == "__main__":

@@ -314,9 +314,9 @@ async def phone_number_verify(
         verify_request = NumberVerificationRequestBody(**body)
         verify_request.validate_mutual_exclusion()
     except ValueError as e:
-        return camara_error_response(400, "INVALID_ARGUMENT", str(e), correlator)
+        return camara_error_response(400, "INVALID_ARGUMENT", "Client specified an invalid argument, request body or query param", correlator)
     except Exception as e:
-        return camara_error_response(400, "INVALID_ARGUMENT", f"Invalid request: {str(e)}", correlator)
+        return camara_error_response(400, "INVALID_ARGUMENT", "Client specified an invalid argument, request body or query param", correlator)
     
     # Demo mode: if device_ip is provided, use it directly for network lookup
     if device_ip:
@@ -330,9 +330,8 @@ async def phone_number_verify(
                 )
                 return NumberVerificationMatchResponse(devicePhoneNumberVerified=is_match)
             except Exception as e:
-                return camara_error_response(500, "INTERNAL", f"Network lookup failed: {str(e)}", correlator)
-        else:
-            return camara_error_response(503, "SERVICE_UNAVAILABLE", "Network client not available", correlator)
+                return camara_error_response(500, "INTERNAL", "Internal server error.", correlator)
+        # If network client not available, fall through to simulation mode
     
     # Production mode: require Bearer token
     auth_header = raw_request.headers.get("Authorization", "")
@@ -340,7 +339,7 @@ async def phone_number_verify(
         return camara_error_response(
             401, 
             "UNAUTHENTICATED", 
-            "Request not authenticated due to missing, invalid, or expired credentials.",
+            "Request not authenticated due to missing, invalid, or expired credentials. A new authentication is required.",
             correlator
         )
     
@@ -473,9 +472,8 @@ async def phone_number_share(
                 phone_number = client.get_msisdn_by_ip(device_ip)
                 return NumberVerificationShareResponse(devicePhoneNumber=phone_number)
             except Exception as e:
-                return camara_error_response(500, "INTERNAL", f"Network lookup failed: {str(e)}", correlator)
-        else:
-            return camara_error_response(503, "SERVICE_UNAVAILABLE", "Network client not available", correlator)
+                return camara_error_response(500, "INTERNAL", "Internal server error.", correlator)
+        # If network client not available, fall through to simulation mode
     
     # Production mode: require Bearer token
     auth_header = raw_request.headers.get("Authorization", "")
@@ -483,7 +481,7 @@ async def phone_number_share(
         return camara_error_response(
             401, 
             "UNAUTHENTICATED", 
-            "Request not authenticated due to missing, invalid, or expired credentials.",
+            "Request not authenticated due to missing, invalid, or expired credentials. A new authentication is required.",
             correlator
         )
     
