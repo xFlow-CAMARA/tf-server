@@ -600,7 +600,6 @@ class NetworkManager(BaseNetworkClient):
         """
         Build flow descriptors compatible with CoreSim's 3GPP implementation.
         """
-        from sunrise6g_opensdk.network.core.base_network_client import build_flows
         return build_flows(flow_id, session_info)
 
     # CAMARA Location API support
