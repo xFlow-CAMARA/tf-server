@@ -248,8 +248,7 @@ def restart_nef_services():
 
 def update_nef_configs(core_name: str):
     """Update NEF configuration files to use the specified core"""
-    import yaml
-    
+
     # Core-specific configurations
     core_configs = {
         "coresim": {
@@ -346,7 +345,6 @@ async def list_cores():
         # Read configuration file if it exists
         if info["configPath"] and os.path.exists(info["configPath"]):
             try:
-                import yaml
                 with open(info["configPath"], 'r') as f:
                     config_data = yaml.safe_load(f)
             except Exception as e:
@@ -357,8 +355,6 @@ async def list_cores():
             # Try to get UEs from metrics first (when simulation is running)
             if connected:
                 try:
-                    import requests
-                    import re
                     # Get metrics from CoreSim metrics endpoint
                     response = requests.get(
                         "http://core-simulator:9090/metrics",
@@ -1790,7 +1786,6 @@ async def get_api_metrics(api: str):
     try:
         from mongodb_logger import MongoDBLoggerMiddleware
         from pymongo import MongoClient
-        from datetime import datetime, timedelta
         
         # Connect to MongoDB
         mongo_uri = os.getenv("MONGODB_URI", "mongodb://mongodb:27017")

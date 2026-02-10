@@ -781,7 +781,7 @@ class NetworkManager(BaseNetworkClient):
             log.debug(f"Extracted subscription ID: {subscription_id}")
         else:
             log.error(f"Unexpected response type from NEF: {type(response)}, content: {response}")
-            raise NetworkPlatformError(f"Invalid response type from NEF QoD service")
+            raise NetworkPlatformError("Invalid response type from NEF QoD service")
 
         try:
             session_id_obj = schemas.SessionId(uuid.UUID(str(subscription_id)))
@@ -812,7 +812,7 @@ class NetworkManager(BaseNetworkClient):
         
         try:
             result = session_info_response.model_dump(mode="json", by_alias=True)
-            log.debug(f"SessionInfo serialization successful")
+            log.debug("SessionInfo serialization successful")
             return result
         except Exception as e:
             log.error(f"Failed to serialize SessionInfo: {e}", exc_info=True)
@@ -965,7 +965,7 @@ class NetworkManager(BaseNetworkClient):
         Updates a traffic influence resource in the NEF Traffic Influence service.
         """
         subscription = self._build_ti_subscription(traffic_influence_info)
-        response = common.traffic_influence_put(
+        common.traffic_influence_put(
             self.ti_base_url, self.scs_as_id, session_id, subscription
         )
         
@@ -989,7 +989,7 @@ class NetworkManager(BaseNetworkClient):
         
         # If response is a list (which shouldn't happen for individual get), get first element
         if isinstance(response, list) and len(response) > 0:
-            log.warning(f"NEF returned list for individual resource get. Using first element.")
+            log.warning("NEF returned list for individual resource get. Using first element.")
             return response[0]
         
         return response
@@ -1004,7 +1004,7 @@ class NetworkManager(BaseNetworkClient):
     # Helper method to compute last location time (from base client)
     def _compute_camara_last_location_time(self, event_time, age_of_location_info_min: int = None):
         """Delegate to base client implementation"""
-        from datetime import datetime, timedelta, timezone
+        from datetime import timedelta, timezone
         if age_of_location_info_min is not None:
             last_location_time = event_time - timedelta(minutes=age_of_location_info_min)
             return last_location_time.replace(tzinfo=timezone.utc)
