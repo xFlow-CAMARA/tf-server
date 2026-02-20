@@ -84,15 +84,15 @@ class MongoDBLoggerMiddleware(BaseHTTPMiddleware):
         """Extract API name from path"""
         if "/quality-on-demand" in path or "/qos-profiles" in path:
             return "QoD"
-        elif "/location-retrieval" in path or "/device-location" in path or "/retrieve" in path:
+        elif "/location-retrieval" in path or "/device-location" in path:
             return "Device Location"
         elif "/traffic-influence" in path:
             return "Traffic Influence"
-        elif "/number-verification" in path or "/verify" in path:
+        elif "/number-verification" in path:
             return "Number Verification"
-        elif "/device-status" in path or "/connectivity" in path or "/roaming" in path:
+        elif "/device-status" in path or "/device-reachability-status" in path or "/connectivity" in path or "/roaming" in path:
             return "Device Status"
-        elif "/sim-swap" in path or "/check" in path:
+        elif "/sim-swap" in path:
             return "SIM Swap"
         else:
             return "Other"
