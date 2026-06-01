@@ -27,6 +27,9 @@ from sunrise6g_opensdk.network.adapters.open5gcore.client import (
 from sunrise6g_opensdk.network.adapters.open5gs.client import (
     NetworkManager as Open5GSClient,
 )
+from sunrise6g_opensdk.network.adapters.free5gc.client import (
+    NetworkManager as Free5GCClient,
+)
 from sunrise6g_opensdk.oran.adapters.i2cat_ric.client import (
     OranManager as OranManageri2CAT,
 )
@@ -62,6 +65,7 @@ def _network_adapters_factory(client_name: str, base_url: str, **kwargs):
         "open5gcore": lambda url, scs_id, **kw: Open5GCoreClient(
             base_url=url, scs_as_id=scs_id, **kw
         ),
+        "free5gc": lambda url, scs_id, **kw: Free5GCClient(base_url=url, scs_as_id=scs_id, **kw),
     }
     try:
         return network_factory[client_name](base_url, scs_as_id, **kwargs)

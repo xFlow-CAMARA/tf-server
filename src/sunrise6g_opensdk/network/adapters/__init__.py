@@ -3,6 +3,6 @@
 # Network adapters for different 5G Core implementations
 ##
 
-from . import coresim, oai, open5gcore, open5gs
+from . import coresim, oai, open5gcore, open5gs, free5gc
 
-__all__ = ["coresim", "oai", "open5gcore", "open5gs"]
+__all__ = ["coresim", "oai", "open5gcore", "open5gs", "free5gc"]

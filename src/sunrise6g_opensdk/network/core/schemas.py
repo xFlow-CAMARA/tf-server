@@ -209,6 +209,7 @@ class TrafficInfluSub(BaseModel):  # Replace with a meaningful name
     )
     ipv4Addr: str | None = None
     ipv6Addr: str | None = None
+    anyUeInd: bool | None = None
 
     notificationDestination: str
     trafficRoutes: list[TrafficRoute] | None = Field(

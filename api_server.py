@@ -63,7 +63,8 @@ def init_network_client(core_name: str):
         "coresim": os.getenv("CORESIM_BASE_URL", "http://localhost:8080"),
         "oai": os.getenv("OAI_BASE_URL", "http://oai-amf:80"),
         "open5gs": os.getenv("OPEN5GS_BASE_URL", "http://localhost:8080"),
-        "open5gcore": os.getenv("OPEN5GCORE_BASE_URL", "http://localhost:8080")
+        "open5gcore": os.getenv("OPEN5GCORE_BASE_URL", "http://localhost:8080"),
+        "free5gc": os.getenv("FREE5GC_NEF_URL", "http://free5gc-nef:8000"),
     }
     
     # CoreSim-specific configuration
@@ -80,6 +81,17 @@ def init_network_client(core_name: str):
                 "location_base_url": os.getenv("NEF_LOCATION_BASE_URL", "http://localhost:8102"),
                 "ti_base_url": os.getenv("NEF_TI_BASE_URL", "http://localhost:8101"),
                 "ue_identity_base_url": os.getenv("NEF_UE_IDENTITY_BASE_URL", "http://localhost:8103"),
+            }
+        }
+    elif core_name.lower() == "free5gc":
+        adapter_specs = {
+            "network": {
+                "client_name": "free5gc",
+                "base_url": base_urls["free5gc"],
+                "scs_as_id": os.getenv("FREE5GC_AF_ID", "camara-dashboard"),
+                "dnn": os.getenv("FREE5GC_DNN", "internet"),
+                "plmn_mcc": os.getenv("FREE5GC_PLMN_MCC", "208"),
+                "plmn_mnc": os.getenv("FREE5GC_PLMN_MNC", "93"),
             }
         }
     else:
@@ -103,6 +115,9 @@ def init_network_client(core_name: str):
 
 # Initialize default CoreSim client
 network_clients["coresim"] = init_network_client("coresim")
+
+# Pre-initialize free5GC client (graceful failure if not reachable)
+network_clients["free5gc"] = init_network_client("free5gc")
 
 # Track active core
 active_core = {"name": "coresim"}  # Default to coresim
@@ -183,12 +198,10 @@ async def set_active_core(request: Request):
             raise HTTPException(status_code=400, detail="Missing 'coreName' field")
         
         if core_name not in network_clients:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Core '{core_name}' not found. Available: {list(network_clients.keys())}"
-            )
+            # Try to initialise on-demand (e.g. free5gc added after startup)
+            network_clients[core_name] = init_network_client(core_name)
         
-        if network_clients[core_name] is None:
+        if network_clients.get(core_name) is None:
             raise HTTPException(
                 status_code=503,
                 detail=f"Core '{core_name}' is not initialized"
@@ -260,7 +273,12 @@ def update_nef_configs(core_name: str):
             "useNrf": True,
             "nrfSvc": "http://oai-nrf:80",
             "pcfSvc": "http://oai-pcf:80"
-        }
+        },
+        "free5gc": {
+            "useNrf": True,
+            "nrfSvc": os.getenv("FREE5GC_NRF_URL", "http://free5gc-nrf:8000"),
+            "pcfSvc": os.getenv("FREE5GC_PCF_URL", "http://free5gc-pcf:8000"),
+        },
     }
     
     config = core_configs.get(core_name, core_configs["coresim"])
@@ -315,6 +333,13 @@ async def list_cores():
             "prometheusUrl": "http://coresim-prometheus:9090",
             "grafanaUrl": "http://grafana:3000",
             "type": "simulator"
+        },
+        "free5gc": {
+            "displayName": "free5GC",
+            "configPath": None,
+            "prometheusUrl": None,
+            "grafanaUrl": None,
+            "type": "production"
         }
     }
     
@@ -331,14 +356,26 @@ async def list_cores():
         ues = []
         
         if is_initialized:
-            try:
-                client = network_clients[core_name]
-                status_response = client.get_status()
-                status_detail = status_response.get("Status", "UNKNOWN")
-                # Only mark as connected if simulation is actually running
-                connected = (status_detail == "STARTED")
-            except Exception as e:
-                status_detail = f"error: {str(e)}"
+            if info["type"] == "simulator":
+                # Simulators expose get_status() to check if simulation is running
+                try:
+                    client = network_clients[core_name]
+                    status_response = client.get_status()
+                    status_detail = status_response.get("Status", "UNKNOWN")
+                    # Only mark as connected if simulation is actually running
+                    connected = (status_detail == "STARTED")
+                except Exception as e:
+                    status_detail = f"error: {str(e)}"
+            else:
+                # Production cores: check reachability via the client's base_url
+                try:
+                    client = network_clients[core_name]
+                    nef_url = getattr(client, "base_url", "")
+                    r = requests.get(f"{nef_url}/", timeout=2)
+                    connected = True
+                    status_detail = "STARTED"
+                except Exception:
+                    status_detail = "unreachable"
         elif has_config:
             status_detail = "configured"
         
